@@ -4,13 +4,15 @@ import hashlib
 import hmac
 from datetime import datetime
 from urllib.parse import quote_plus
-
+from io import StringIO
 import boto3
 import urllib3
+import os
+import subprocess
 from botocore.exceptions import ClientError
 
 
-def copy_logs_from_rds_to_s3(rds_instance_name, s3_bucket_name, region, log_prefix="", min_size=0):
+def copy_logs_from_rds_to_s3(rds_instance_name, s3_bucket_name, region, log_prefix="", min_size=0, work_dir=""):
     """
     Download log files from an RDS instance, and upload them to an S3 bucket. Adopted from AWS's RDS support tool
     'move-rds-logs-to-s3'.
@@ -83,25 +85,25 @@ def copy_logs_from_rds_to_s3(rds_instance_name, s3_bucket_name, region, log_pref
 
             # Download the log file
             try:
-                log_file_data = get_log_file_via_rest(http, filename, rds_instance_name, region)
+                log_file_path = get_log_file_via_rest(http, filename, rds_instance_name, region, work_dir)
             except Exception as e:
                 raise RuntimeError(f"File '{filename}' download failed: {e}")
 
             if log_last_written > last_written_this_run:
                 last_written_this_run = log_last_written + 1
 
-            compressed_size = len(log_file_data)
-            pct_difference = 100 * (compressed_size - size) // size
-            print(f"Compressed log file size: {compressed_size} bytes ({pct_difference}% difference)")
+            # TODO zst encode
+            zst_exec = subprocess.run(["zstd", "--rm", log_file_path])
 
             # Upload the log file to S3
-            object_name = f"{rds_instance_name}/backup_{backup_start_time.isoformat()}/{filename}.gz"
+            object_name = f"{rds_instance_name}/{filename}.zst"
             try:
-                s3_client.put_object(Bucket=s3_bucket_name, Key=object_name, Body=log_file_data)
+                s3_client.upload_file(f"{log_file_path}.zst", s3_bucket_name, object_name)
                 copied_file_count += 1
             except ClientError as e:
                 err_msg = f"Error writing object to S3 bucket, S3 ClientError: {e.response['Error']['Message']}"
                 raise RuntimeError(err_msg)
+            os.remove(f"{log_file_path}.zst")
 
             print(f"Uploaded log file {object_name} to S3 bucket {s3_bucket_name}")
 
@@ -124,7 +126,7 @@ def copy_logs_from_rds_to_s3(rds_instance_name, s3_bucket_name, region, log_pref
     print("Log file export complete")
 
 
-def get_log_file_via_rest(http, filename, db_instance_identifier, region):
+def get_log_file_via_rest(http, filename, db_instance_identifier, region, work_dir):
     """
     AWS's web API is a bit esoteric and requires an arduous signing process. In general, the process can
     be broken down into the following four steps:
@@ -217,14 +219,22 @@ def get_log_file_via_rest(http, filename, db_instance_identifier, region):
     request_url = f"{endpoint}{canonical_uri}?{signed_querystring}"
     print(f"Request URL: {request_url}")
 
+    # local file name
+    local_file_path = os.path.join(work_dir, filename)
+    os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+
     # Setting the encoding to gzip has potential to save ~90% on file size
-    response = http.request(method, request_url, decode_content=False, headers={"Accept-Encoding": "gzip"})
-    print(f"Response code: {response.status}")
+    with http.request(method, request_url, preload_content=False) as r, open(local_file_path, 'wb+') as f:
+        print(f"Response code: {r.status}")
 
-    if response.status > 200:
-        raise RuntimeError(f"Could not download log file due to HTTP error status {response.status}")
+        if r.status > 200:
+            raise RuntimeError(f"Could not download log file due to HTTP error status {r.status}")
 
-    return response.data
+        for chunk in r.stream(128*1024): 
+            if chunk:
+                f.write(chunk)
+
+    return local_file_path
 
 
 def get_signature_key(key, date, region_name, service_name):
@@ -284,6 +294,8 @@ def parse_args():
                         help='Filter logs with this prefix (default: empty string)', default="")
     parser.add_argument('--min-size', action='store', required=False, type=int,
                         help='Filters logs less than the specified size in bytes (default: 0)', default=0)
+    parser.add_argument('--work-dir', action='store', required=True,
+                        help='The working directory to use when processing rds log files')
     return parser.parse_args()
 
 
@@ -325,5 +337,6 @@ if __name__ == '__main__':
         args.s3_bucket_name,
         args.aws_region,
         args.log_prefix,
-        args.min_size
+        args.min_size,
+        args.work_dir
     )
